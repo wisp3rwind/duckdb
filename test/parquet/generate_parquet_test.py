@@ -28,7 +28,7 @@ def get_files():
     path = os.path.join('data','parquet-testing')
     for root, dirs, files in os.walk(path):
         for file in files:
-            if file.endswith(".parquet"):               
+            if file.endswith(".parquet") and "SNAPPY" in file:
                 files_path.append(os.path.join(root, file))
     return files_path
 

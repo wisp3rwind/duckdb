@@ -1,11 +1,19 @@
 #! /usr/bin/env python3
 
+import io
 import itertools
 import numpy as np
 from numpy.random import Generator, PCG64
 from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
+import snappy
+import shutil
+import struct
+from thrift.protocol.TCompactProtocol import TCompactProtocol
+from thrift.transport.TTransport import TFileObjectTransport
+
+import parquet_format.ttypes as fmt
 
 
 """Generate data to test parquet data page decompression."""
@@ -70,6 +78,119 @@ def build_table():
     return pa.Table.from_pydict(columns)
 
 
+def recompress(codec, comp_data):
+    comp_size = len(compressed_data)
+    if codec == fmt.CompressionCodec.UNCOMPRESSED:
+        return comp_data
+    elif codec == fmt.CompressionCodec.SNAPPY:
+        uncompressed_data = snappy.uncompress(comp_data)
+    elif codec == fmt.CompressionCodec.GZIP:
+        return comp_data
+    elif codec == fmt.CompressionCodec.LZO:
+        return comp_data
+    elif codec == fmt.CompressionCodec.BROTLI:
+        return comp_data
+    elif codec == fmt.CompressionCodec.LZ4:
+        return comp_data
+    elif codec == fmt.CompressionCodec.ZSTD:
+        return comp_data
+    elif codec == fmt.CompressionCodec.LZ4_RAW:
+        return comp_data
+    else:
+        return comp_data
+
+    uncomp_size = len(uncompressed_data)
+    uncompressed_data = (
+        uncompressed_data[:uncomp_size // 2]
+        + b"A" * (2 * uncomp_size)
+    )
+
+    if codec == fmt.CompressionCodec.SNAPPY:
+        comp_data = snappy.compress(uncomp_data)
+    else:
+        assert False
+
+    # Be sure that the added constant b"A" compressed well
+    # enough to fit the original space in the file. This
+    # might leave some garbage after the compressed data,
+    # but that shouldn't matter.
+    assert len(compressed_data) <= comp_size
+
+    return comp_data
+
+def rewrite_pq_table(path, path_out):
+    """Read a parquet file from `path' and iterate over the Thrift structures. Write a
+    potentially modified file to `path_out`.
+    """
+    f = open(path, "rb")
+    fout = open(path_out, "wb")
+    fsize = f.seek(0, io.SEEK_END)
+    assert fsize >= 12
+    f.seek(0)
+
+    trans = TFileObjectTransport(f)
+    protocol = TCompactProtocol(trans)
+
+    magic = f.read(4)
+    assert magic == b"PAR1"
+
+    f.seek(fsize - 8)
+    footer_len = struct.unpack("<I", f.read(4))[0]
+    magic = f.read(4)
+    assert footer_len > 0
+    assert magic == b"PAR1"
+    metadata_pos = fsize - 8 - footer_len
+    assert metadata_pos > 0
+
+    f.seek(metadata_pos)
+    metadata = fmt.FileMetaData()
+    metadata.read(protocol)
+
+    f.seek(0)
+    shutil.copyfileobj(f, fout)
+
+    f.seek(4)
+    for row_group in metadata.row_groups:
+        for column_chunk in row_group.columns:
+            # print(repr(column_chunk))
+            print(repr(column_chunk.meta_data))
+            column_meta_data = column_chunk.meta_data
+
+            # metadata_offset = column_chunk.file_offset
+            # f.seek(metadata_offset)
+            # column_meta_data = fmt.ColumnMetaData()
+            # column_meta_data.read(protocol)
+            print(repr(column_meta_data))
+
+            f.seek(column_meta_data.data_page_offset)
+
+            while f.tell() < column_chunk.file_offset:
+                page_hdr = fmt.PageHeader()
+                page_hdr.read(protocol)
+                print(repr(page_hdr))
+
+                if page_hdr.type == fmt.PageType.DATA_PAGE:
+                    pos = f.tell()
+                    fout.seek(pos)
+                    compressed_data = f.read(page_hdr.compressed_page_size)
+                    compressed_data = recompress(
+                        column_meta_data.codec,
+                        compressed_data,
+                    )
+                    fout.write(compressed_data)
+                elif page_hdr.type == fmt.PageType.DATA_PAGE_V2:
+                    f.seek(page_hdr.compressed_page_size, io.SEEK_CUR)
+                    ...
+                else:
+                    pass
+                    f.seek(page_hdr.compressed_page_size, io.SEEK_CUR)
+
+    f.close()
+    fout.close()
+
+    assert path.stat().st_size == path_out.stat().st_size
+
+
 table = build_table()
 
 root = Path("generated")
@@ -81,11 +202,18 @@ for compression, data_page_version in itertools.product(COMPRESSION_CODECS, DATA
         "compression": compression,
     }
 
+    basename = "_".join([
+        f"data_page={data_page_version[0]}",
+        f"{compression}",
+    ])
+
     pq.write_table(
         table,
-        (root / "_".join([
-            f"data_page={data_page_version[0]}",
-            f"{compression}",
-        ])).with_suffix(".parquet"),
+        (root / basename).with_suffix(".parquet"),
         **pq_args
+    )
+
+    rewrite_pq_table(
+        (root / basename).with_suffix(".parquet"),
+        (root / f"{basename}-size_mismatch").with_suffix(".parquet"),
     )
