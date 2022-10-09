@@ -1,7 +1,9 @@
 #! /usr/bin/env python3
 
+import gzip
 import io
 import itertools
+import lz4
 import numpy as np
 from numpy.random import Generator, PCG64
 from pathlib import Path
@@ -12,6 +14,7 @@ import shutil
 import struct
 from thrift.protocol.TCompactProtocol import TCompactProtocol
 from thrift.transport.TTransport import TFileObjectTransport
+import zstd
 
 import parquet_format.ttypes as fmt
 
@@ -81,32 +84,39 @@ def build_table():
 def recompress(codec, comp_data):
     comp_size = len(compressed_data)
     if codec == fmt.CompressionCodec.UNCOMPRESSED:
-        return comp_data
+        raise ValueError()
     elif codec == fmt.CompressionCodec.SNAPPY:
-        uncompressed_data = snappy.uncompress(comp_data)
+        uncomp_data = snappy.uncompress(comp_data)
     elif codec == fmt.CompressionCodec.GZIP:
-        return comp_data
+        uncomp_data = gzip.decompress(comp_data)
     elif codec == fmt.CompressionCodec.LZO:
-        return comp_data
+        # not supported by duckdb
+        raise NotImplementedError()
     elif codec == fmt.CompressionCodec.BROTLI:
-        return comp_data
+        # not supported by duckdb
+        raise NotImplementedError()
     elif codec == fmt.CompressionCodec.LZ4:
-        return comp_data
+        # Deprecated compression format with a non-standard framing scheme.
+        # Not supported by duckdb, and current pyarrow doesn't even write this
+        # anymore.
+        raise NotImplementedError()
     elif codec == fmt.CompressionCodec.ZSTD:
-        return comp_data
+        uncomp_data = zstd.uncompress(comp_data)
     elif codec == fmt.CompressionCodec.LZ4_RAW:
-        return comp_data
+        # New LZ4 scheme, not supported by duckdb
+        raise NotImplementedError()
     else:
-        return comp_data
+        raise NotImplementedError()
 
-    uncomp_size = len(uncompressed_data)
-    uncompressed_data = (
-        uncompressed_data[:uncomp_size // 2]
-        + b"A" * (2 * uncomp_size)
-    )
+    uncomp_size = len(uncomp_data)
+    uncomp_data = (uncomp_data[:uncomp_size // 2] + b"A" * (2 * uncomp_size))
 
     if codec == fmt.CompressionCodec.SNAPPY:
         comp_data = snappy.compress(uncomp_data)
+    elif codec == fmt.CompressionCodec.GZIP:
+        comp_data = gzip.compress(uncomp_data)
+    elif codec == fmt.CompressionCodec.ZSTD:
+        comp_data = zstd.compress(uncomp_data, level=6)
     else:
         assert False
 
@@ -179,10 +189,10 @@ def rewrite_pq_table(path, path_out):
                     )
                     fout.write(compressed_data)
                 elif page_hdr.type == fmt.PageType.DATA_PAGE_V2:
+                    raise NotImplementedError()
                     f.seek(page_hdr.compressed_page_size, io.SEEK_CUR)
-                    ...
                 else:
-                    pass
+                    # Not a data page
                     f.seek(page_hdr.compressed_page_size, io.SEEK_CUR)
 
     f.close()
@@ -213,7 +223,13 @@ for compression, data_page_version in itertools.product(COMPRESSION_CODECS, DATA
         **pq_args
     )
 
-    rewrite_pq_table(
-        (root / basename).with_suffix(".parquet"),
-        (root / f"{basename}-size_mismatch").with_suffix(".parquet"),
-    )
+    if compression == "NONE":
+        continue
+
+    try:
+        rewrite_pq_table(
+            (root / basename).with_suffix(".parquet"),
+            (root / f"{basename}-size_mismatch").with_suffix(".parquet"),
+        )
+    except NotImplementedError:
+        pass
